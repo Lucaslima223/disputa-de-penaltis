@@ -361,22 +361,23 @@ function interruptGame(){
 }
 
 // ================= Online (room) =================
-// Dois transportes: 'room' (dentro do Claude) e 'p2p' (PeerJS/WebRTC, em qualquer site, como o GitHub Pages).
+// Dois transportes: 'room' (dentro do Claude) e 'relay' (MQTT por WebSocket, em qualquer site, como o GitHub Pages).
 let transport=null;
-const PEER_PREFIX='disputa-penaltis-v1-';
-function loadPeerJS(){
+const BROKERS=['wss://broker.emqx.io:8084/mqtt','wss://broker.hivemq.com:8884/mqtt'];
+const TOPIC_PREFIX='disputa-penaltis/v1/';
+function loadMqtt(){
   return new Promise((res,rej)=>{
-    if(window.Peer)return res();
+    if(window.mqtt)return res();
     const s=document.createElement('script');
-    s.src='https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js';
-    s.onload=()=>window.Peer?res():rej(new Error('peerjs'));s.onerror=()=>rej(new Error('peerjs'));
+    s.src='https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js';
+    s.onload=()=>window.mqtt?res():rej(new Error('mqtt'));s.onerror=()=>rej(new Error('mqtt'));
     document.head.appendChild(s);
   });
 }
 function initOnline(){
   const note=$('onlineNote');
   const enable=(t,msg,wait)=>{transport=t;$('btnCreate').disabled=false;$('btnJoin').disabled=false;note.textContent=msg;$('waitHint').textContent=wait;};
-  const failP2P=()=>{note.textContent='Não consegui carregar o modo online. Confira a internet e recarregue a página; dá pra treinar contra a CPU enquanto isso.';};
+  const failRelay=()=>{note.textContent='Não consegui carregar o modo online. Confira a internet e recarregue a página; dá pra treinar contra a CPU enquanto isso.';};
   if(window.claude&&typeof window.claude.use==='function'){
     window.claude.use('room').then(r=>{
       if(!r){note.textContent='O modo online não está disponível nesta visualização. Dá pra treinar contra a CPU.';return;}
@@ -384,51 +385,48 @@ function initOnline(){
       enable('room','Seu amigo precisa abrir este mesmo jogo no Claude (compartilhe pelo botão Compartilhar) e estar logado.','Ele precisa abrir este mesmo jogo no Claude (compartilhe pelo botão Compartilhar) e entrar com o código. A partida começa assim que ele chegar.');
     }).catch(()=>{note.textContent='O modo online não está disponível nesta visualização. Dá pra treinar contra a CPU.';});
   } else {
-    loadPeerJS().then(()=>enable('p2p','Seu amigo só precisa abrir este mesmo link e entrar com o código.','Ele só precisa abrir este mesmo link e entrar com o código. A partida começa assim que ele chegar.')).catch(failP2P);
+    loadMqtt().then(()=>enable('relay','Seu amigo só precisa abrir este mesmo link e entrar com o código.','Ele só precisa abrir este mesmo link e entrar com o código. A partida começa assim que ele chegar.')).catch(failRelay);
   }
 }
-// Canal P2P com a mesma interface usada pelo jogo: presence(), peers(), onConnection(), leave().
-function makeP2P(codeStr,asHost,onIdTaken){
-  let me=null,conn=null,remote=null,remoteId=null,open=false,closed=false,connCb=null,retryT=null;
-  const myPres={};
-  const peer=new window.Peer(asHost?PEER_PREFIX+codeStr:undefined,{debug:0});
-  const setOpen=v=>{open=v;if(connCb){try{connCb(v);}catch(e){}}};
-  const send=()=>{if(conn&&conn.open){try{conn.send({t:'p',p:myPres});}catch(e){}}};
-  function attach(c){
-    if(conn&&conn!==c){
-      if(conn.open&&conn.peer!==c.peer){try{c.close();}catch(e){}return;}
-      try{conn.close();}catch(e){}
-    }
-    conn=c;
-    c.on('open',()=>{remoteId=c.peer;send();});
-    c.on('data',d=>{
-      if(conn===c&&d&&typeof d==='object'&&d.t==='p'&&d.p&&typeof d.p==='object'&&!Array.isArray(d.p)){remote=Object.freeze(Object.assign({},d.p));remoteId=c.peer;}
-    });
-    c.on('close',()=>{if(conn===c){conn=null;remote=null;if(!asHost)retry();}});
-    c.on('error',()=>{});
+// Canal pela internet com a mesma interface usada pelo jogo: presence(), peers(), onConnection(), leave().
+// Publica a presença em dois servidores MQTT públicos ao mesmo tempo; basta um deles funcionar para os dois jogadores.
+function makeRelay(codeStr){
+  const myId='j'+Math.random().toString(36).slice(2,10)+Date.now().toString(36);
+  const topic=TOPIC_PREFIX+codeStr;
+  const myPres={},others=new Map();
+  let connCb=null,anyOpen=false,seq=0;
+  const update=()=>{const o=clients.some(c=>c.connected);if(o!==anyOpen){anyOpen=o;if(connCb){try{connCb(o);}catch(e){}}}};
+  const send=extra=>{
+    const msg=JSON.stringify(Object.assign({id:myId,s:++seq,p:myPres},extra||{}));
+    for(const c of clients){if(c.connected){try{c.publish(topic,msg,{qos:0});}catch(e){}}}
+  };
+  const receive=buf=>{
+    let d;try{d=JSON.parse(typeof buf==='string'?buf:new TextDecoder().decode(buf));}catch(e){return;}
+    if(!d||typeof d!=='object'||typeof d.id!=='string'||d.id===myId||d.id.length>40)return;
+    if(d.bye){others.delete(d.id);return;}
+    if(!d.p||typeof d.p!=='object'||Array.isArray(d.p)||typeof d.s!=='number')return;
+    const prev=others.get(d.id);
+    if(prev&&d.s<=prev.s){if(d.s===prev.s)prev.seen=Date.now();return;}
+    others.set(d.id,{presence:Object.freeze(Object.assign({},d.p)),s:d.s,seen:Date.now()});
+  };
+  const clients=[];
+  for(const url of BROKERS){
+    let c;try{c=window.mqtt.connect(url,{clean:true,connectTimeout:8000,reconnectPeriod:3000,keepalive:30});}catch(e){continue;}
+    c.on('connect',()=>{c.subscribe(topic,{qos:0});update();send();});
+    c.on('close',update);c.on('offline',update);c.on('error',()=>{});
+    c.on('message',(t,buf)=>receive(buf));
+    clients.push(c);
   }
-  function connect(){if(!closed&&me)attach(peer.connect(PEER_PREFIX+codeStr,{reliable:true}));}
-  function retry(){if(closed)return;clearTimeout(retryT);retryT=setTimeout(()=>{if(!conn||!conn.open)connect();},2000);}
-  peer.on('open',id=>{me=id;setOpen(true);if(!asHost)connect();});
-  peer.on('connection',c=>{if(asHost)attach(c);else{try{c.close();}catch(e){}}});
-  peer.on('disconnected',()=>{setOpen(false);if(!closed)setTimeout(()=>{try{if(!closed&&peer.disconnected)peer.reconnect();}catch(e){}},1500);});
-  peer.on('error',err=>{
-    const t=err&&err.type;
-    if(t==='peer-unavailable')retry();
-    else if(t==='unavailable-id'){if(onIdTaken)onIdTaken();}
-    else if(t==='network'||t==='server-error'||t==='socket-error'||t==='socket-closed')setOpen(false);
-  });
-  const beat=setInterval(send,2000);
+  const beat=setInterval(()=>{send();const now=Date.now();for(const [key,v] of others)if(now-v.seen>7000)others.delete(key);},1500);
   return {
     presence(patch){for(const key in patch){if(patch[key]===null)delete myPres[key];else myPres[key]=patch[key];}send();return Promise.resolve();},
     peers(){
-      const a=[];
-      if(me)a.push({peer:me,sameTab:true,isMe:true,kind:'viewer',presence:myPres});
-      if(conn&&conn.open&&remote)a.push({peer:remoteId,sameTab:false,isMe:false,kind:'viewer',presence:remote});
+      const a=[{peer:myId,sameTab:true,isMe:true,kind:'viewer',presence:myPres}];
+      for(const [key,v] of others)a.push({peer:key,sameTab:false,isMe:false,kind:'viewer',presence:v.presence});
       return a;
     },
-    onConnection(cb){connCb=cb;setTimeout(()=>{if(connCb)cb(open);},0);return ()=>{connCb=null;};},
-    leave(){closed=true;clearTimeout(retryT);clearInterval(beat);try{peer.destroy();}catch(e){}return Promise.resolve();}
+    onConnection(cb){connCb=cb;setTimeout(()=>{if(connCb)cb(anyOpen);},0);return ()=>{connCb=null;};},
+    leave(){clearInterval(beat);send({bye:true});for(const c of clients){try{c.end(false);}catch(e){}}return Promise.resolve();}
   };
 }
 initOnline();
@@ -462,7 +460,7 @@ async function goOnline(asHost,codeIn){
   if(transport==='room'){
     try{c=await roomNS.join('pen-'+code.toLowerCase());}catch(e){c=roomNS;}
   } else {
-    try{c=makeP2P(code,asHost,()=>{if(token===joinToken){leaveOnline();goOnline(true);}});}catch(e){c=null;}
+    try{c=makeRelay(code);}catch(e){c=null;}
     if(!c){toMenu();$('onlineNote').textContent='Não consegui conectar ao modo online agora. Tente de novo em instantes.';return;}
   }
   if(token!==joinToken||mode!=='online'){if(c&&c!==roomNS)c.leave().catch(()=>{});return;}

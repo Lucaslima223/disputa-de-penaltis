@@ -17,9 +17,9 @@ Jogo de disputa de pênaltis feito em HTML, CSS e JavaScript puro (canvas), num 
 
 ## Como funciona o online
 
-No GitHub Pages (ou em qualquer site), os dois navegadores se conectam direto um ao outro por WebRTC usando a biblioteca [PeerJS](https://peerjs.com/), carregada do jsDelivr. O servidor público e gratuito do PeerJS só apresenta os dois jogadores; depois disso as jogadas vão de um navegador para o outro. O código da partida vira o identificador de quem criou a partida.
+No GitHub Pages (ou em qualquer site), os dois navegadores trocam mensagens por WebSocket através de servidores MQTT públicos e gratuitos ([EMQX](https://www.emqx.com/en/mqtt/public-mqtt5-broker) e [HiveMQ](https://www.hivemq.com/mqtt/public-mqtt-broker/)), usando a biblioteca [MQTT.js](https://github.com/mqttjs/MQTT.js) carregada do jsDelivr. O jogo publica nos dois servidores ao mesmo tempo, então basta um deles funcionar. Cada partida usa um canal com o código de 4 letras. Como os servidores são públicos, não coloque informações pessoais no apelido.
 
-Quando o jogo é aberto como artefato no Claude (claude.ai), ele usa a sincronização própria do Claude no lugar do PeerJS.
+Quando o jogo é aberto como artefato no Claude (claude.ai), ele usa a sincronização própria do Claude no lugar dos servidores MQTT.
 
 Cada jogador envia só a própria jogada (onde chutou ou para onde pulou), e os dois aparelhos calculam o resultado da cobrança com a mesma regra, então o placar fica igual nos dois lados.
 
