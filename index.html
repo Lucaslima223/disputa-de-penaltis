@@ -110,7 +110,7 @@ canvas{display:block;width:100%;aspect-ratio:8/5;touch-action:manipulation;curso
       <h2>Partida criada</h2>
       <p>Mande este código para seu amigo:</p>
       <div class="code" id="codeShow"></div>
-      <p class="small">Ele precisa abrir este mesmo jogo no Claude (compartilhe pelo botão Compartilhar) e entrar com o código. A partida começa assim que ele chegar.</p>
+      <p class="small" id="waitHint">Ele precisa abrir este mesmo jogo e entrar com o código. A partida começa assim que ele chegar.</p>
       <div class="btns"><button class="ghost" id="btnCancelWait">Cancelar</button></div>
     </div>
     <div id="vJoin" hidden>
@@ -361,16 +361,75 @@ function interruptGame(){
 }
 
 // ================= Online (room) =================
+// Dois transportes: 'room' (dentro do Claude) e 'p2p' (PeerJS/WebRTC, em qualquer site, como o GitHub Pages).
+let transport=null;
+const PEER_PREFIX='disputa-penaltis-v1-';
+function loadPeerJS(){
+  return new Promise((res,rej)=>{
+    if(window.Peer)return res();
+    const s=document.createElement('script');
+    s.src='https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js';
+    s.onload=()=>window.Peer?res():rej(new Error('peerjs'));s.onerror=()=>rej(new Error('peerjs'));
+    document.head.appendChild(s);
+  });
+}
 function initOnline(){
   const note=$('onlineNote');
-  const off=()=>{note.textContent='O modo online funciona com o jogo aberto no Claude, com login. Aqui, dá pra treinar contra a CPU.';};
-  if(!(window.claude&&typeof window.claude.use==='function')){off();return;}
-  window.claude.use('room').then(r=>{
-    roomNS=r;
-    if(!r){off();return;}
-    $('btnCreate').disabled=false;$('btnJoin').disabled=false;
-    note.textContent='Seu amigo precisa abrir este mesmo jogo no Claude (compartilhe pelo botão Compartilhar) e estar logado.';
-  }).catch(off);
+  const enable=(t,msg,wait)=>{transport=t;$('btnCreate').disabled=false;$('btnJoin').disabled=false;note.textContent=msg;$('waitHint').textContent=wait;};
+  const failP2P=()=>{note.textContent='Não consegui carregar o modo online. Confira a internet e recarregue a página; dá pra treinar contra a CPU enquanto isso.';};
+  if(window.claude&&typeof window.claude.use==='function'){
+    window.claude.use('room').then(r=>{
+      if(!r){note.textContent='O modo online não está disponível nesta visualização. Dá pra treinar contra a CPU.';return;}
+      roomNS=r;
+      enable('room','Seu amigo precisa abrir este mesmo jogo no Claude (compartilhe pelo botão Compartilhar) e estar logado.','Ele precisa abrir este mesmo jogo no Claude (compartilhe pelo botão Compartilhar) e entrar com o código. A partida começa assim que ele chegar.');
+    }).catch(()=>{note.textContent='O modo online não está disponível nesta visualização. Dá pra treinar contra a CPU.';});
+  } else {
+    loadPeerJS().then(()=>enable('p2p','Seu amigo só precisa abrir este mesmo link e entrar com o código.','Ele só precisa abrir este mesmo link e entrar com o código. A partida começa assim que ele chegar.')).catch(failP2P);
+  }
+}
+// Canal P2P com a mesma interface usada pelo jogo: presence(), peers(), onConnection(), leave().
+function makeP2P(codeStr,asHost,onIdTaken){
+  let me=null,conn=null,remote=null,remoteId=null,open=false,closed=false,connCb=null,retryT=null;
+  const myPres={};
+  const peer=new window.Peer(asHost?PEER_PREFIX+codeStr:undefined,{debug:0});
+  const setOpen=v=>{open=v;if(connCb){try{connCb(v);}catch(e){}}};
+  const send=()=>{if(conn&&conn.open){try{conn.send({t:'p',p:myPres});}catch(e){}}};
+  function attach(c){
+    if(conn&&conn!==c){
+      if(conn.open&&conn.peer!==c.peer){try{c.close();}catch(e){}return;}
+      try{conn.close();}catch(e){}
+    }
+    conn=c;
+    c.on('open',()=>{remoteId=c.peer;send();});
+    c.on('data',d=>{
+      if(conn===c&&d&&typeof d==='object'&&d.t==='p'&&d.p&&typeof d.p==='object'&&!Array.isArray(d.p)){remote=Object.freeze(Object.assign({},d.p));remoteId=c.peer;}
+    });
+    c.on('close',()=>{if(conn===c){conn=null;remote=null;if(!asHost)retry();}});
+    c.on('error',()=>{});
+  }
+  function connect(){if(!closed&&me)attach(peer.connect(PEER_PREFIX+codeStr,{reliable:true}));}
+  function retry(){if(closed)return;clearTimeout(retryT);retryT=setTimeout(()=>{if(!conn||!conn.open)connect();},2000);}
+  peer.on('open',id=>{me=id;setOpen(true);if(!asHost)connect();});
+  peer.on('connection',c=>{if(asHost)attach(c);else{try{c.close();}catch(e){}}});
+  peer.on('disconnected',()=>{setOpen(false);if(!closed)setTimeout(()=>{try{if(!closed&&peer.disconnected)peer.reconnect();}catch(e){}},1500);});
+  peer.on('error',err=>{
+    const t=err&&err.type;
+    if(t==='peer-unavailable')retry();
+    else if(t==='unavailable-id'){if(onIdTaken)onIdTaken();}
+    else if(t==='network'||t==='server-error'||t==='socket-error'||t==='socket-closed')setOpen(false);
+  });
+  const beat=setInterval(send,2000);
+  return {
+    presence(patch){for(const key in patch){if(patch[key]===null)delete myPres[key];else myPres[key]=patch[key];}send();return Promise.resolve();},
+    peers(){
+      const a=[];
+      if(me)a.push({peer:me,sameTab:true,isMe:true,kind:'viewer',presence:myPres});
+      if(conn&&conn.open&&remote)a.push({peer:remoteId,sameTab:false,isMe:false,kind:'viewer',presence:remote});
+      return a;
+    },
+    onConnection(cb){connCb=cb;setTimeout(()=>{if(connCb)cb(open);},0);return ()=>{connCb=null;};},
+    leave(){closed=true;clearTimeout(retryT);clearInterval(beat);try{peer.destroy();}catch(e){}return Promise.resolve();}
+  };
 }
 initOnline();
 
@@ -391,7 +450,7 @@ function readOpp(){
   return {x,y};
 }
 async function goOnline(asHost,codeIn){
-  if(!roomNS)return;
+  if(!transport)return;
   const token=++joinToken;
   mode='online';role=asHost?'host':'guest';mySide=asHost?'A':'B';
   code=asHost?genCode():codeIn;paired=false;oppPeer=null;myPeer=null;oppGoneSince=0;match=0;myInputs=[];interrupted=false;
@@ -399,8 +458,13 @@ async function goOnline(asHost,codeIn){
   if(asHost){$('codeShow').textContent=code;showLobbyView('wait');}
   else{$('codeJoin').textContent=code;$('joinHint').textContent='';showLobbyView('join');}
   setStatus(asHost?'Esperando adversário':'Procurando partida',asHost?`Código da partida: ${code}`:'Conectando…');
-  let c;
-  try{c=await roomNS.join('pen-'+code.toLowerCase());}catch(e){c=roomNS;}
+  let c=null;
+  if(transport==='room'){
+    try{c=await roomNS.join('pen-'+code.toLowerCase());}catch(e){c=roomNS;}
+  } else {
+    try{c=makeP2P(code,asHost,()=>{if(token===joinToken){leaveOnline();goOnline(true);}});}catch(e){c=null;}
+    if(!c){toMenu();$('onlineNote').textContent='Não consegui conectar ao modo online agora. Tente de novo em instantes.';return;}
+  }
   if(token!==joinToken||mode!=='online'){if(c&&c!==roomNS)c.leave().catch(()=>{});return;}
   ch=c;
   try{unsubConn=ch.onConnection(ok=>setConn(ok?'● online':'○ reconectando…'),()=>setConn('○ sem conexão'));}catch(e){}
@@ -409,7 +473,7 @@ async function goOnline(asHost,codeIn){
 function leaveOnline(){
   joinToken++;
   if(ch){
-    if(ch!==roomNS)ch.leave().catch(()=>{});
+    if(ch!==roomNS)Promise.resolve(ch.leave()).catch(()=>{});
     else roomNS.presence({g:null,role:null,nick:null,match:null,vs:null,inp:null}).catch(()=>{});
   }
   if(unsubConn){try{unsubConn();}catch(e){}}
